@@ -1,0 +1,21 @@
+[requires]
+#gtest/1.11.0#7475482232fcd017fa110b0b8b0f936e
+#onetbb/2021.12.0#4f9f625a208de091295c79201233bd92
+simdjson/3.2.0#f39b3b6bffa30c72bb91f78ed2bcca78
+# openssl/3.2.0#30b857fa0927b5917fe3463c8c0ba38f
+# tinyxml2/10.0.0#832c7f8038cef53f6427577d6e66a7a8
+#cpp-httplib/0.18.1#1648db5218b5cf40c633614e15fc1ed6
+
+[generators]
+CMakeDeps
+CMakeToolchain
+
+[options]
+#gtest/*:build_gmock=False
+#cpp-httplib/*:with_openssl=True
+
+[imports]
+bin, *.pdb -> ./bin
+bin, *.pdb -> ./lib
+bin, *.dll -> ./bin
+bin, *.exe -> ./tools
