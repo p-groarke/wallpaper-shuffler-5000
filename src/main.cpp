@@ -8,58 +8,113 @@
 #include <fea/utility/file.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <string>
 #include <thread>
+#include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <windows.h>
 
+// Could be useful.
+// HKEY_CURRENT_USER\Control Panel\Desktop\WallpaperStyle
+enum class wallpaper_style : unsigned {
+	tile = 0,
+	center = 1,
+	stretch = 2,
+	fill = 3,
+	fit = 4,
+	span = 5,
+};
+
 // We need a clock with specified time_since_epock.
 // TODO : Deal with daylight savings etc.
+using serialize_clock = std::chrono::system_clock;
 using serialize_time_point = std::chrono::system_clock::time_point;
 using serialize_duration = std::chrono::system_clock::duration;
 
 namespace {
-const serialize_duration shuffle_time = std::chrono::days{ 1 };
+const serialize_duration shuffle_interval = std::chrono::days{ 1 };
 const std::array<std::wstring, 4> img_extensions{
 	L".bmp",
 	L".jpg",
 	L".jpeg",
 	L".png",
 };
+const std::wstring save_data_filename = L"wallpaper-shuffler-5000.bin";
 } // namespace
 
 struct img {
 	bool shown = false;
-	std::wstring path;
+	// uint32_t shown_times = 0;
+	uint64_t file_size = 0;
+	std::wstring filename;
+	// std::wstring path;
+
+	friend void serialize(const img& v, fea::serializer& ofs) {
+		using fea::serialize;
+		serialize(v.shown, ofs);
+		serialize(v.file_size, ofs);
+		serialize(v.filename, ofs);
+		// serialize(v.path, ofs);
+	}
+
+	friend bool deserialize(fea::deserializer& ifs, img& v) {
+		using fea::deserialize;
+		if (!deserialize(ifs, v.shown)) {
+			return false;
+		}
+		if (!deserialize(ifs, v.file_size)) {
+			return false;
+		}
+		if (!deserialize(ifs, v.filename)) {
+			return false;
+		}
+		// if (!deserialize(ifs, v.path)) {
+		//	return false;
+		// }
+		return true;
+	}
 };
 
 struct save_data {
-	std::wstring last_img_folder;
-	serialize_time_point last_shuffle{};
+	serialize_time_point last_shuffle_time{};
+	// std::wstring last_img_folder;
 	std::vector<img> imgs;
+
+	friend void serialize(const save_data& v, fea::serializer& ofs) {
+		using fea::serialize;
+		serialize(v.last_shuffle_time, ofs);
+		// serialize(v.last_img_folder, ofs);
+		serialize(v.imgs, ofs);
+	}
+
+	friend bool deserialize(fea::deserializer& ifs, save_data& v) {
+		using fea::deserialize;
+		if (!deserialize(ifs, v.last_shuffle_time)) {
+			return false;
+		}
+		// if (!deserialize(ifs, v.last_img_folder)) {
+		//	return false;
+		// }
+		if (!deserialize(ifs, v.imgs)) {
+			return false;
+		}
+		return true;
+	}
 };
 
 void serialize(const std::filesystem::path& v, fea::serializer& ofs) {
 	using fea::serialize;
 	serialize(v.wstring(), ofs);
-}
-
-void serialize(const img& v, fea::serializer& ofs) {
-	using fea::serialize;
-	serialize(v.shown, ofs);
-	serialize(v.path, ofs);
-}
-
-void serialize(const save_data& v, fea::serializer& ofs) {
-	using fea::serialize;
-	serialize(v.last_img_folder, ofs);
-	serialize(v.last_shuffle, ofs);
-	serialize(v.imgs, ofs);
 }
 
 bool deserialize(fea::deserializer& ifs, std::filesystem::path& v) {
@@ -72,54 +127,52 @@ bool deserialize(fea::deserializer& ifs, std::filesystem::path& v) {
 	return true;
 }
 
-bool deserialize(fea::deserializer& ifs, img& v) {
-	using fea::deserialize;
-	if (!deserialize(ifs, v.shown)) {
+// Returns true on success.
+template <class T>
+bool get_registry_value(HKEY hkey, const std::wstring& path,
+		const std::wstring& value, T* out_ptr) {
+
+	static_assert(std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>
+						  || std::is_same_v<T, std::wstring>,
+			"Unsupported output type.");
+
+	unsigned dw_flags = 0;
+	if constexpr (std::is_same_v<T, uint32_t>) {
+		dw_flags = RRF_RT_DWORD;
+	} else if constexpr (std::is_same_v<T, uint64_t>) {
+		dw_flags = RRF_RT_QWORD;
+	} else {
+		dw_flags = RRF_RT_REG_SZ;
+	}
+
+	std::vector<uint8_t> buf(MAX_PATH + 1, 0);
+	DWORD reg_value_size = DWORD(buf.size());
+	if (LSTATUS err = RegGetValueW(hkey, path.c_str(), value.c_str(), dw_flags,
+				nullptr, buf.data(), &reg_value_size);
+			err != ERROR_SUCCESS) {
+		// Failed.
+		std::wcerr << std::format(
+				L"Failed to get regex value : '{}\\{}'\n", path, value);
+
+		std::error_code ec{ int(err), std::system_category() };
+		fea::print_error_message_w(__FUNCTION__, __LINE__, ec);
 		return false;
 	}
-	if (!deserialize(ifs, v.path)) {
-		return false;
+
+	if constexpr (std::is_same_v<T, std::wstring>) {
+		std::wstring& str = *out_ptr;
+		size_t str_size = size_t(reg_value_size / 2) + 1;
+		if (str.size() < str_size) {
+			str = std::wstring(str_size, L'\0');
+		}
+		char* out_char_ptr = reinterpret_cast<char*>(str.data());
+		std::memcpy(out_char_ptr, buf.data(), reg_value_size);
+	} else {
+		char* out_char_ptr = reinterpret_cast<char*>(out_ptr);
+		std::memcpy(out_char_ptr, buf.data(), reg_value_size);
 	}
 	return true;
 }
-
-bool deserialize(fea::deserializer& ifs, save_data& v) {
-	using fea::deserialize;
-	if (!deserialize(ifs, v.last_img_folder)) {
-		return false;
-	}
-	if (!deserialize(ifs, v.last_shuffle)) {
-		return false;
-	}
-	if (!deserialize(ifs, v.imgs)) {
-		return false;
-	}
-	return true;
-}
-
-// void serialize(const save_data& in, fea::ini& out) {
-// }
-//
-// void deserialize(fea::ini& in, save_data& out) {
-//	static const ws_settings_v0 defaults{};
-//
-//	std::string img_folder = in["User Settings"]["image_folder_path"]
-//						   | defaults.img_folder.string();
-//	out.img_folder = img_folder;
-//
-//	std::string last_img_folder = in["User Settings"]["last_image_folder_path"]
-//								| defaults.last_img_folder.string();
-//	out.last_img_folder = last_img_folder;
-//
-//	int64_t last_shuffle = in["User Settings"]["last_shuffle_time"]
-//						 | defaults.last_shuffle.time_since_epoch().count();
-//	out.last_shuffle
-//			= serialize_time_point{ serialize_duration{ last_shuffle } };
-// }
-
-//[[nodiscard]]
-// bool doit(const ws_settings&) {
-//}
 
 int wmain(int argc, wchar_t** argv, wchar_t**) {
 	fea::fast_iostreams();
@@ -175,39 +228,9 @@ int wmain(int argc, wchar_t** argv, wchar_t**) {
 		return EXIT_FAILURE;
 	}
 
-	// Load our data.
-	// Create default settings file if we don't have it.
-	save_data data;
-	std::filesystem::path exe_dir = fea::executable_dir(argv[0]);
-	const std::wstring data_filename = L"wallpaper-shuffler-5000.bin";
-	std::filesystem::path data_filepath = exe_dir / data_filename;
-
+	// Go through the folder and gather all images.
+	std::vector<std::filesystem::path> all_images;
 	{
-
-		if (!std::filesystem::exists(data_filepath)) {
-			save_data default_data{};
-
-			using fea::serialize;
-			fea::serializer ofs{ data_filepath };
-			serialize(default_data, ofs);
-		}
-
-		if (!std::filesystem::exists(data_filepath)) {
-			std::wcerr << std::format(L"Couldn't create save file : '{}'\n",
-					data_filepath.wstring());
-			return EXIT_FAILURE;
-		}
-
-		using fea::deserialize;
-		fea::deserializer ifs{ data_filepath };
-		deserialize(ifs, data);
-	}
-
-	if (data.last_img_folder.empty() || data.last_img_folder != img_folder) {
-		// Changed image folder, recompute fully.
-		data.last_shuffle = {};
-		data.imgs.clear();
-
 		if (verbose) {
 			std::wcout << L"Scanning folder...\n";
 		}
@@ -231,37 +254,152 @@ int wmain(int argc, wchar_t** argv, wchar_t**) {
 				continue;
 			}
 
-			data.imgs.push_back(img{ .shown = false, .path = p.wstring() });
+			all_images.push_back(p);
 		}
 
-		if (data.imgs.empty()) {
-			std::wcout << L"Found no images, exiting.\n";
+		if (all_images.empty()) {
+			std::wcout << L"No images found, exiting.\n";
 			return EXIT_FAILURE;
 		}
 		std::wcout << L"Success!\n";
-
-		if (verbose) {
-			std::wcout << L"\nShuffling images...\n";
-			fea::random_shuffle(data.imgs);
-			std::wcout << L"Success!\n";
-
-			std::wcout << L"\nSorted Images :\n";
-			for (const img& v : data.imgs) {
-				std::filesystem::path p = v.path;
-				std::wcout << std::format(L"'{}', ", p.filename().wstring());
-			}
-		}
-
-		data.last_img_folder = img_folder;
-		data.last_shuffle = std::chrono::system_clock::now();
-
-		using fea::serialize;
-		fea::serializer ofs{ data_filepath };
-		serialize(data, ofs);
 	}
 
+	// Load our save data.
+	serialize_time_point last_shuffle_time{};
+	last_shuffle_time;
+	std::vector<img> sorted_images;
+	{
+		save_data data;
+		std::filesystem::path exe_dir = fea::executable_dir(argv[0]);
+		std::filesystem::path data_filepath = exe_dir / save_data_filename;
+
+		if (std::filesystem::exists(data_filepath)) {
+			using fea::deserialize;
+			fea::deserializer ifs{ data_filepath };
+			deserialize(ifs, data);
+
+			last_shuffle_time = data.last_shuffle_time;
+
+			auto new_end = std::remove_if(
+					data.imgs.begin(), data.imgs.end(), [&](const img& v) {
+						std::filesystem::path img_path
+								= img_folder / v.filename;
+						if (!std::filesystem::exists(img_path)) {
+							return true;
+						}
+						if (uint64_t(std::filesystem::file_size(img_path))
+								!= v.file_size) {
+							return true;
+						}
+						return false;
+					});
+			data.imgs.erase(new_end, data.imgs.end());
+			sorted_images = std::move(data.imgs);
+		}
+	}
+	assert(std::is_partitioned(sorted_images.begin(), sorted_images.end(),
+			[](const img& v) { return !v.shown; }));
+
+	// Find new images in the folder.
+	{
+		std::unordered_set<std::filesystem::path> saved_images_set;
+		for (const img& v : sorted_images) {
+			saved_images_set.insert(v.filename);
+		}
+
+		auto new_end = std::remove_if(all_images.begin(), all_images.end(),
+				[&](const std::filesystem::path& p) {
+					return saved_images_set.contains(p.filename());
+				});
+		all_images.erase(new_end, all_images.end());
+	}
+
+	// Shuffle in the new images to the pre-existing images.
+	if (!all_images.empty()) {
+
+		std::vector<img> temp;
+		temp.reserve(all_images.size());
+		for (const std::filesystem::path& p : all_images) {
+			assert(std::filesystem::exists(p)
+					&& !std::filesystem::is_directory(p));
+
+			temp.push_back(img{
+					.shown = false,
+					.file_size = std::filesystem::file_size(p),
+					.filename = p.filename(),
+			});
+		}
+		sorted_images.insert(sorted_images.begin(), temp.begin(), temp.end());
+
+		auto notshown_end = std::find_if(sorted_images.begin(),
+				sorted_images.end(), [](const img& v) { return v.shown; });
+		fea::random_shuffle(sorted_images.begin(), notshown_end);
+	}
+
+	assert(std::is_partitioned(sorted_images.begin(), sorted_images.end(),
+			[](const img& v) { return !v.shown; }));
+
+	// Now check if we need to shuffle. If we do, change the background
+	// and update save data.
+	if (serialize_clock::now() >= last_shuffle_time + shuffle_interval) {
+		last_shuffle_time = serialize_clock::now();
+	}
+
+
+	// std::vector<img> sorted_images;
+
+
+	//{
+
+	//	if (!std::filesystem::exists(data_filepath)) {
+	//		save_data default_data{};
+
+	//		using fea::serialize;
+	//		fea::serializer ofs{ data_filepath };
+	//		serialize(default_data, ofs);
+	//	}
+
+	//	if (!std::filesystem::exists(data_filepath)) {
+	//		std::wcerr << std::format(L"Couldn't create save file : '{}'\n",
+	//				data_filepath.wstring());
+	//		return EXIT_FAILURE;
+	//	}
+
+	//	using fea::deserialize;
+	//	fea::deserializer ifs{ data_filepath };
+	//	deserialize(ifs, data);
+	//}
+
+	// if (data.last_img_folder.empty() || data.last_img_folder !=
+	// img_folder) {
+	//	// Changed image folder, recompute fully.
+	//	data.shuffle_time = {};
+	//	data.imgs.clear();
+
+
+	//	if (verbose) {
+	//		std::wcout << L"\nShuffling images...\n";
+	//		fea::random_shuffle(data.imgs);
+	//		std::wcout << L"Success!\n";
+
+	//		std::wcout << L"\nSorted Images :\n";
+	//		for (const img& v : data.imgs) {
+	//			std::filesystem::path p = v.path;
+	//			std::wcout << std::format(L"'{}', ",
+	// p.filename().wstring());
+	//		}
+	//	}
+
+	//	data.last_img_folder = img_folder;
+	//	data.shuffle_time = std::chrono::system_clock::now();
+
+	//	using fea::serialize;
+	//	fea::serializer ofs{ data_filepath };
+	//	serialize(data, ofs);
+	//}
+
 	// Does the current wallpaper match expectations.
-	std::wstring path(MAX_PATH, L'\0');
+	std::wstring path(MAX_PATH + 1, L'\0');
 	if (!SystemParametersInfoW(
 				SPI_GETDESKWALLPAPER, MAX_PATH, path.data(), 0u)) {
 		fea::print_error_message_w(
