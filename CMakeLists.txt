@@ -94,6 +94,7 @@ find_package(simdjson CONFIG REQUIRED)
 file(GLOB_RECURSE HEADERS "include/*.hpp" "include/*.h" "include/*.tpp")
 file(GLOB_RECURSE SOURCES "src/*.cpp" "src/*.c" "src/*.hpp" "src/*.h" "src/*.tpp")
 add_executable(${PROJECT_NAME} ${HEADERS} ${SOURCES})
+# add_executable(${PROJECT_NAME} WIN32 ${HEADERS} ${SOURCES})
 target_include_directories(${PROJECT_NAME} PRIVATE include)
 target_include_directories(${PROJECT_NAME} PRIVATE src) # For based paths.
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -108,9 +109,11 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 
 fea_set_compile_options(${PROJECT_NAME} PUBLIC)
 fea_static_runtime(${PROJECT_NAME})
-target_compile_definitions(${PROJECT_NAME} PUBLIC _WIN32_WINNT=0x0601)
+fea_whole_program_optimization(${PROJECT_NAME} PUBLIC)
+
+# target_compile_definitions(${PROJECT_NAME} PUBLIC _WIN32_WINNT=0x0601)
 target_compile_definitions(${PROJECT_NAME} PRIVATE -DVERSION=L"${PROJECT_VERSION}")
-target_compile_definitions(${PROJECT_NAME} PRIVATE -DWIN32_LEAN_AND_MEAN -DWIN32_EXTRA_LEAN -DVC_EXTRALEAN)
+# target_compile_definitions(${PROJECT_NAME} PRIVATE -DWIN32_LEAN_AND_MEAN -DWIN32_EXTRA_LEAN -DVC_EXTRALEAN)
 
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR}/include PREFIX "Header Files" FILES ${LIB_HEADERS})
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR}/src PREFIX "Source Files" FILES ${LIB_SOURCES})

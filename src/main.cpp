@@ -6,6 +6,8 @@
 #include <fea/terminal/utf8_io.hpp>
 #include <fea/utility/error.hpp>
 #include <fea/utility/file.hpp>
+#include <wil/resource.h>
+#include <wil/result.h>
 
 #include <algorithm>
 #include <cassert>
@@ -15,24 +17,32 @@
 #include <format>
 #include <fstream>
 #include <iostream>
-#include <map>
+#include <random>
 #include <string>
 #include <thread>
 #include <type_traits>
-#include <unordered_map>
 #include <unordered_set>
 
+// IDesktopWallpaper
+// https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-idesktopwallpaper
+#define _ATL_APARTMENT_THREADED
+#include <atlbase.h>
+extern CComModule _Module;
+#include <atlcom.h>
+#include <functiondiscoverykeys.h>
+
+#include <ShObjIdl.h>
+#include <shellapi.h>
 #include <windows.h>
 
-// Could be useful.
-// HKEY_CURRENT_USER\Control Panel\Desktop\WallpaperStyle
-enum class wallpaper_style : unsigned {
-	tile = 0,
-	center = 1,
-	stretch = 2,
-	fill = 3,
-	fit = 4,
-	span = 5,
+struct coinit {
+	coinit() {
+		THROW_IF_FAILED_MSG(::CoInitializeEx(nullptr, COINIT_MULTITHREADED),
+				"Couldn't initialize COM.\n");
+	}
+	~coinit() {
+		::CoUninitialize();
+	}
 };
 
 // We need a clock with specified time_since_epock.
@@ -42,14 +52,18 @@ using serialize_time_point = std::chrono::system_clock::time_point;
 using serialize_duration = std::chrono::system_clock::duration;
 
 namespace {
+inline const coinit _coinit;
+#if 1
 const serialize_duration shuffle_interval = std::chrono::days{ 1 };
+#else
+const serialize_duration shuffle_interval = std::chrono::seconds{ 5 };
+#endif
 const std::array<std::wstring, 4> img_extensions{
 	L".bmp",
 	L".jpg",
 	L".jpeg",
 	L".png",
 };
-const std::wstring save_data_filename = L"wallpaper-shuffler-5000.bin";
 } // namespace
 
 struct img {
@@ -112,71 +126,314 @@ struct save_data {
 	}
 };
 
-void serialize(const std::filesystem::path& v, fea::serializer& ofs) {
-	using fea::serialize;
-	serialize(v.wstring(), ofs);
-}
+template <class RndIt>
+void randomizeit(RndIt first, RndIt last) {
+	// auto printit = [&]() {
+	//	for (auto it = first; it != last; ++it) {
+	//		std::wcout << std::format(L"{}, ", it->filename);
+	//	}
+	//	std::wcout << "\n";
+	// };
 
-bool deserialize(fea::deserializer& ifs, std::filesystem::path& v) {
-	using fea::deserialize;
-	std::wstring wstr;
-	if (!deserialize(ifs, wstr)) {
-		return false;
-	}
-	v = wstr;
-	return true;
+	unsigned t1 = unsigned(
+			std::chrono::steady_clock::now().time_since_epoch().count());
+	unsigned t2 = 0;
+	unsigned t3 = 0;
+	unsigned t4 = 0;
+	do {
+		t2 = unsigned(
+				std::chrono::steady_clock::now().time_since_epoch().count());
+	} while (t2 == t1);
+	do {
+		t3 = unsigned(
+				std::chrono::steady_clock::now().time_since_epoch().count());
+	} while (t3 == t2);
+	do {
+		t4 = unsigned(
+				std::chrono::steady_clock::now().time_since_epoch().count());
+	} while (t4 == t3);
+
+	assert(t1 != t2 && t2 != t3 && t3 != t4);
+
+	std::random_device rd;
+	std::seed_seq seed{
+		t1 ^ rd(),
+		t2 ^ rd(),
+		t3 ^ rd(),
+		t4 ^ rd(),
+	};
+	std::mt19937_64 gen(seed);
+
+	// printit();
+	std::reverse(first, last);
+	std::shuffle(first, last, gen);
+	// printit();
+	std::reverse(first, last);
+	std::shuffle(first, last, gen);
+	// printit();
 }
 
 // Returns true on success.
-template <class T>
-bool get_registry_value(HKEY hkey, const std::wstring& path,
-		const std::wstring& value, T* out_ptr) {
+// Outputs the next update time.
+bool update(const std::filesystem::path& data_filepath,
+		const std::filesystem::path& img_folder, bool verbose,
+		serialize_time_point* out_next_update) {
 
-	static_assert(std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>
-						  || std::is_same_v<T, std::wstring>,
-			"Unsupported output type.");
+	// Load our save data.
+	save_data data;
+	if (std::filesystem::exists(data_filepath)) {
+		if (verbose) {
+			std::wcout << L"Loading saved data.\n";
+		}
 
-	unsigned dw_flags = 0;
-	if constexpr (std::is_same_v<T, uint32_t>) {
-		dw_flags = RRF_RT_DWORD;
-	} else if constexpr (std::is_same_v<T, uint64_t>) {
-		dw_flags = RRF_RT_QWORD;
-	} else {
-		dw_flags = RRF_RT_REG_SZ;
+		using fea::deserialize;
+		fea::deserializer ifs{ data_filepath };
+		deserialize(ifs, data);
 	}
 
-	std::vector<uint8_t> buf(MAX_PATH + 1, 0);
-	DWORD reg_value_size = DWORD(buf.size());
-	if (LSTATUS err = RegGetValueW(hkey, path.c_str(), value.c_str(), dw_flags,
-				nullptr, buf.data(), &reg_value_size);
-			err != ERROR_SUCCESS) {
-		// Failed.
-		std::wcerr << std::format(
-				L"Failed to get regex value : '{}\\{}'\n", path, value);
+	// If we have nothing to do, exit cleanly now.
+	serialize_time_point now = serialize_clock::now();
+	if (now < data.last_shuffle_time + shuffle_interval) {
+		if (verbose) {
+			std::wcout << L"Update interval unreached, going back to "
+						  L"sleep.\n";
+		}
 
-		std::error_code ec{ int(err), std::system_category() };
-		fea::print_error_message_w(__FUNCTION__, __LINE__, ec);
+		(*out_next_update) = data.last_shuffle_time + shuffle_interval;
+		return true;
+	}
+	(*out_next_update) = now + shuffle_interval;
+
+	if (verbose) {
+		std::wcout << L"Time interval reached, changing wallpaper.\n";
+	}
+
+	// Remove obsolete or changed images from our saved data.
+	{
+		auto new_end = std::remove_if(
+				data.imgs.begin(), data.imgs.end(), [&](const img& v) {
+					std::filesystem::path img_path = img_folder / v.filename;
+					if (!std::filesystem::exists(img_path)) {
+						return true;
+					}
+					if (uint64_t(std::filesystem::file_size(img_path))
+							!= v.file_size) {
+						return true;
+					}
+					return false;
+				});
+		data.imgs.erase(new_end, data.imgs.end());
+
+		assert(std::is_partitioned(data.imgs.begin(), data.imgs.end(),
+				[](const img& v) { return !v.shown; }));
+	}
+
+#if 0
+	// TEMP TESTING
+	{
+		auto notshown_end = std::find_if(data.imgs.begin(), data.imgs.end(),
+				[](const img& v) { return v.shown; });
+		size_t s = size_t(std::distance(data.imgs.begin(), notshown_end));
+
+		// Erase half unshown for testing purposes.
+		data.imgs.erase(data.imgs.begin(), data.imgs.begin() + (s / 2));
+	}
+#endif
+
+	// Go through the folder and gather new images.
+	std::vector<std::filesystem::path> new_images;
+	{
+		if (verbose) {
+			std::wcout << L"Scanning folder.\n";
+		}
+
+		for (const std::filesystem::path& p :
+				std::filesystem::directory_iterator(img_folder)) {
+			if (std::filesystem::is_directory(p)) {
+				if (verbose) {
+					std::wcout << std::format(L"\tSkipping sub-folder '{}'\n",
+							p.filename().wstring());
+				}
+				continue;
+			}
+
+			std::wstring ext = p.extension();
+			if (!std::ranges::contains(img_extensions, ext)) {
+				if (verbose) {
+					std::wcout << std::format(L"\tSkipping non-image '{}'\n",
+							p.filename().wstring());
+				}
+				continue;
+			}
+
+			new_images.push_back(p);
+		}
+
+		if (new_images.empty()) {
+			std::wcout << L"No images found in folder.\n";
+			return false;
+		}
+
+		// Remove old images from the new images in the folder.
+		std::unordered_set<std::filesystem::path> old_images_set;
+		for (const img& v : data.imgs) {
+			old_images_set.insert(v.filename);
+		}
+
+		auto new_end = std::remove_if(new_images.begin(), new_images.end(),
+				[&](const std::filesystem::path& p) {
+					return old_images_set.contains(p.filename());
+				});
+		new_images.erase(new_end, new_images.end());
+	}
+
+	// Shuffle in the new images into the pre-existing images.
+	if (!new_images.empty()) {
+		if (verbose) {
+			std::wcout << std::format(
+					L"Adding {} new images to the playlist.\n",
+					new_images.size());
+		}
+
+		std::vector<img> temp;
+		temp.reserve(new_images.size());
+		for (const std::filesystem::path& p : new_images) {
+			assert(std::filesystem::exists(p)
+					&& !std::filesystem::is_directory(p));
+
+			temp.push_back(img{
+					.shown = false,
+					.file_size = std::filesystem::file_size(p),
+					.filename = p.filename(),
+			});
+		}
+		data.imgs.insert(data.imgs.begin(), temp.begin(), temp.end());
+
+		auto notshown_end = std::find_if(data.imgs.begin(), data.imgs.end(),
+				[](const img& v) { return v.shown; });
+
+		if (verbose) {
+			std::wcout << L"Randomizing.\n";
+		}
+
+		randomizeit(data.imgs.begin(), notshown_end);
+
+		// fea::random_shuffle(data.imgs.begin(), notshown_end);
+		// fea::random_shuffle(data.imgs.begin(), notshown_end);
+		// fea::random_shuffle(data.imgs.begin(), notshown_end);
+		// fea::random_shuffle(data.imgs.begin(), notshown_end);
+		// fea::random_shuffle(data.imgs.begin(), notshown_end);
+	}
+	assert(std::is_partitioned(data.imgs.begin(), data.imgs.end(),
+			[](const img& v) { return !v.shown; }));
+
+	if (std::all_of(data.imgs.begin(), data.imgs.end(),
+				[](const img& v) { return v.shown; })) {
+		if (verbose) {
+			std::wcout
+					<< L"Reached end of playlist, resetting and reshuffling.\n";
+		}
+
+		randomizeit(data.imgs.begin(), data.imgs.end());
+
+		for (img& v : data.imgs) {
+			v.shown = false;
+		}
+	}
+
+	// Change the wallpaper.
+	CComPtr<IDesktopWallpaper> desktop_wallpaper;
+	if (!SUCCEEDED(desktop_wallpaper.CoCreateInstance(
+				__uuidof(DesktopWallpaper)))) {
+		std::wcerr << L"Couldn't CoCreateInstance.\n";
 		return false;
 	}
 
-	if constexpr (std::is_same_v<T, std::wstring>) {
-		std::wstring& str = *out_ptr;
-		size_t str_size = size_t(reg_value_size / 2) + 1;
-		if (str.size() < str_size) {
-			str = std::wstring(str_size, L'\0');
+	unsigned num_monitors = 0;
+	if (!SUCCEEDED(
+				desktop_wallpaper->GetMonitorDevicePathCount(&num_monitors))) {
+		std::wcerr << L"Couldn't get monitor count.\n";
+		return false;
+	}
+	assert(num_monitors != 0);
+
+	if (verbose) {
+		std::wcout << std::format(L"Detect {} monitors :\n", num_monitors);
+	}
+
+	if (num_monitors > data.imgs.size()) {
+		// Q : Soft fail?
+		std::wcerr << L"More monitors than images in folder, exiting.\n";
+		return false;
+	}
+
+	std::vector<std::wstring> monitor_ids;
+	monitor_ids.reserve(num_monitors);
+	for (unsigned i = 0; i < num_monitors; ++i) {
+		wchar_t* str_ptr = nullptr;
+		if (!SUCCEEDED(
+					desktop_wallpaper->GetMonitorDevicePathAt(i, &str_ptr))) {
+			std::wcerr << std::format(L"Couldn't get monitor {} path.\n", i);
+			return false;
 		}
-		char* out_char_ptr = reinterpret_cast<char*>(str.data());
-		std::memcpy(out_char_ptr, buf.data(), reg_value_size);
-	} else {
-		char* out_char_ptr = reinterpret_cast<char*>(out_ptr);
-		std::memcpy(out_char_ptr, buf.data(), reg_value_size);
+
+		monitor_ids.push_back(std::wstring{ str_ptr });
+		if (verbose) {
+			std::wcout << std::format(L"\t{}\n", str_ptr);
+		}
+	}
+
+	for (size_t i = 0; i < monitor_ids.size(); ++i) {
+		img image = data.imgs.front();
+		std::filesystem::path path = img_folder / image.filename;
+		if (verbose) {
+			std::wcout << std::format(
+					L"Setting new wallpaper on monitor {} : '{}'\n", i + 1,
+					image.filename);
+		}
+
+		if (!SUCCEEDED(desktop_wallpaper->SetWallpaper(
+					monitor_ids[i].c_str(), path.c_str()))) {
+			std::wcerr << L"Couldn't set wallpaper.\n";
+			return false;
+		}
+
+		if (!SUCCEEDED(desktop_wallpaper->SetPosition(DWPOS_FILL))) {
+			std::wcerr << L"Couldn't set wallpaper fill.\n";
+			return false;
+		}
+
+		image.shown = true;
+		data.imgs.erase(data.imgs.begin());
+		data.imgs.push_back(std::move(image));
+	}
+
+	data.last_shuffle_time = now;
+
+	// Serialize the update.
+	{
+		using fea::serialize;
+		fea::serializer ofs{ data_filepath };
+		serialize(data, ofs);
+	}
+
+	if (verbose) {
+		std::wcout << L"Success!\n\n";
 	}
 	return true;
 }
 
+#if 1
 int wmain(int argc, wchar_t** argv, wchar_t**) {
 	fea::fast_iostreams();
 	auto on_exit_reset_term = fea::utf8_io(true);
+#else
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR lpCmdLine, int) {
+	fea::fast_iostreams();
+
+	int argc = 0;
+	wchar_t** argv = CommandLineToArgvW(lpCmdLine, &argc);
+#endif
 
 	std::filesystem::path img_folder{};
 	bool verbose = false;
@@ -228,251 +485,24 @@ int wmain(int argc, wchar_t** argv, wchar_t**) {
 		return EXIT_FAILURE;
 	}
 
-	// Go through the folder and gather all images.
-	std::vector<std::filesystem::path> all_images;
-	{
-		if (verbose) {
-			std::wcout << L"Scanning folder...\n";
-		}
+	std::filesystem::path exe_dir = fea::executable_dir(argv[0]);
+	std::filesystem::path save_data_filename = L"wallpaper-shuffler-5000.bin";
+	std::filesystem::path data_filepath = exe_dir / save_data_filename;
 
-		for (const std::filesystem::path& p :
-				std::filesystem::directory_iterator(img_folder)) {
-			if (std::filesystem::is_directory(p)) {
-				if (verbose) {
-					std::wcout << std::format(L"\tSkipping sub-folder : '{}'\n",
-							p.filename().wstring());
-				}
-				continue;
-			}
+	// ShowWindow(GetConsoleWindow(), SW_HIDE);
+	// FreeConsole();
+	//  Use int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
+	//  PWSTR pCmdLine, int nCmdShow); and set the last parameter to false (if
+	//  you're using windows)
 
-			std::wstring ext = p.extension();
-			if (!std::ranges::contains(img_extensions, ext)) {
-				if (verbose) {
-					std::wcout << std::format(L"\tSkipping non-image : '{}'\n",
-							p.filename().wstring());
-				}
-				continue;
-			}
-
-			all_images.push_back(p);
-		}
-
-		if (all_images.empty()) {
-			std::wcout << L"No images found, exiting.\n";
+	while (true) {
+		serialize_time_point next_update{};
+		if (!update(data_filepath, img_folder, verbose, &next_update)) {
 			return EXIT_FAILURE;
 		}
-		std::wcout << L"Success!\n";
+
+		std::this_thread::sleep_until(next_update);
 	}
-
-	// Load our save data.
-	serialize_time_point last_shuffle_time{};
-	last_shuffle_time;
-	std::vector<img> sorted_images;
-	{
-		save_data data;
-		std::filesystem::path exe_dir = fea::executable_dir(argv[0]);
-		std::filesystem::path data_filepath = exe_dir / save_data_filename;
-
-		if (std::filesystem::exists(data_filepath)) {
-			using fea::deserialize;
-			fea::deserializer ifs{ data_filepath };
-			deserialize(ifs, data);
-
-			last_shuffle_time = data.last_shuffle_time;
-
-			auto new_end = std::remove_if(
-					data.imgs.begin(), data.imgs.end(), [&](const img& v) {
-						std::filesystem::path img_path
-								= img_folder / v.filename;
-						if (!std::filesystem::exists(img_path)) {
-							return true;
-						}
-						if (uint64_t(std::filesystem::file_size(img_path))
-								!= v.file_size) {
-							return true;
-						}
-						return false;
-					});
-			data.imgs.erase(new_end, data.imgs.end());
-			sorted_images = std::move(data.imgs);
-		}
-	}
-	assert(std::is_partitioned(sorted_images.begin(), sorted_images.end(),
-			[](const img& v) { return !v.shown; }));
-
-	// Find new images in the folder.
-	{
-		std::unordered_set<std::filesystem::path> saved_images_set;
-		for (const img& v : sorted_images) {
-			saved_images_set.insert(v.filename);
-		}
-
-		auto new_end = std::remove_if(all_images.begin(), all_images.end(),
-				[&](const std::filesystem::path& p) {
-					return saved_images_set.contains(p.filename());
-				});
-		all_images.erase(new_end, all_images.end());
-	}
-
-	// Shuffle in the new images to the pre-existing images.
-	if (!all_images.empty()) {
-
-		std::vector<img> temp;
-		temp.reserve(all_images.size());
-		for (const std::filesystem::path& p : all_images) {
-			assert(std::filesystem::exists(p)
-					&& !std::filesystem::is_directory(p));
-
-			temp.push_back(img{
-					.shown = false,
-					.file_size = std::filesystem::file_size(p),
-					.filename = p.filename(),
-			});
-		}
-		sorted_images.insert(sorted_images.begin(), temp.begin(), temp.end());
-
-		auto notshown_end = std::find_if(sorted_images.begin(),
-				sorted_images.end(), [](const img& v) { return v.shown; });
-		fea::random_shuffle(sorted_images.begin(), notshown_end);
-	}
-
-	assert(std::is_partitioned(sorted_images.begin(), sorted_images.end(),
-			[](const img& v) { return !v.shown; }));
-
-	// Now check if we need to shuffle. If we do, change the background
-	// and update save data.
-	if (serialize_clock::now() >= last_shuffle_time + shuffle_interval) {
-		last_shuffle_time = serialize_clock::now();
-	}
-
-
-	// std::vector<img> sorted_images;
-
-
-	//{
-
-	//	if (!std::filesystem::exists(data_filepath)) {
-	//		save_data default_data{};
-
-	//		using fea::serialize;
-	//		fea::serializer ofs{ data_filepath };
-	//		serialize(default_data, ofs);
-	//	}
-
-	//	if (!std::filesystem::exists(data_filepath)) {
-	//		std::wcerr << std::format(L"Couldn't create save file : '{}'\n",
-	//				data_filepath.wstring());
-	//		return EXIT_FAILURE;
-	//	}
-
-	//	using fea::deserialize;
-	//	fea::deserializer ifs{ data_filepath };
-	//	deserialize(ifs, data);
-	//}
-
-	// if (data.last_img_folder.empty() || data.last_img_folder !=
-	// img_folder) {
-	//	// Changed image folder, recompute fully.
-	//	data.shuffle_time = {};
-	//	data.imgs.clear();
-
-
-	//	if (verbose) {
-	//		std::wcout << L"\nShuffling images...\n";
-	//		fea::random_shuffle(data.imgs);
-	//		std::wcout << L"Success!\n";
-
-	//		std::wcout << L"\nSorted Images :\n";
-	//		for (const img& v : data.imgs) {
-	//			std::filesystem::path p = v.path;
-	//			std::wcout << std::format(L"'{}', ",
-	// p.filename().wstring());
-	//		}
-	//	}
-
-	//	data.last_img_folder = img_folder;
-	//	data.shuffle_time = std::chrono::system_clock::now();
-
-	//	using fea::serialize;
-	//	fea::serializer ofs{ data_filepath };
-	//	serialize(data, ofs);
-	//}
-
-	// Does the current wallpaper match expectations.
-	std::wstring path(MAX_PATH + 1, L'\0');
-	if (!SystemParametersInfoW(
-				SPI_GETDESKWALLPAPER, MAX_PATH, path.data(), 0u)) {
-		fea::print_error_message_w(
-				__FUNCTION__, __LINE__, fea::last_os_error());
-		return -1;
-	}
-	// BOOL SystemParametersInfoW(
-	//   [in]      UINT  uiAction,
-	//   [in]      UINT  uiParam,
-	//   [in, out] PVOID pvParam,
-	//   [in]      UINT  fWinIni
-	//);
-
-	// while (true) {
-	//	std::this_thread::sleep_for(std::chrono::seconds{ 2 });
-
-	//	// Reload settings if updated.
-	//	std::chrono::time_point<std::chrono::file_clock> new_timestamp
-	//			= std::filesystem::last_write_time(settings_filepath);
-	//	if (new_timestamp > settings_timestamp) {
-	//		ui_proxy.log(L"Detected ini settings change, reloading.");
-	//		ws_settings = load_ini(settings_filepath, ui_proxy);
-	//		sim.update_settings(ws_settings);
-	//		settings_timestamp = new_timestamp;
-	//	}
-	//}
 
 	return EXIT_SUCCESS;
 }
-
-// int main() {
-//     const wchar_t *path = L"C:\\image.png";
-//     int result;
-//     result = SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, (void *)path,
-//     SPIF_UPDATEINIFILE); std::cout << result; return 0;
-// }
-
-// class Program
-//{
-//     [DllImport("user32.dll")]
-//     public static extern bool SystemParametersInfo(UInt32 uiAction, UInt32
-//     uiParam, string pvParam, UInt32 fWinIni); static FileInfo[] images;
-//     static int currentImage;
-//
-//     static void Main(string[] args)
-//     {
-//         DirectoryInfo dirInfo = new
-//         DirectoryInfo(@"C:/users/Smart-PC/Desktop"); images =
-//         dirInfo.GetFiles("*.bmp", SearchOption.TopDirectoryOnly);
-//
-//         currentImage = 0;
-//
-//         System.Timers.Timer imageChangeTimer = new Timer(5000);
-//         imageChangeTimer.Elapsed += new
-//         ElapsedEventHandler(imageChangeTimer_Elapsed);
-//         imageChangeTimer.Start();
-//
-//         Console.ReadLine();
-//     }
-//
-//     static void imageChangeTimer_Elapsed(object sender, ElapsedEventArgs e)
-//     {
-//         const uint SPI_SETDESKWALLPAPER = 30;
-//         const int SPIF_UPDATEINIFILE = 0x01;
-//         const int SPIF_SENDWININICHANGE = 0x02;
-//         bool gk;
-//         gk = SystemParametersInfo(SPI_SETDESKWALLPAPER, 0,
-//         images[currentImage++].FullName, SPIF_SENDWININICHANGE |
-//         SPIF_UPDATEINIFILE); Console.Write(gk);
-//         Console.WriteLine(images[currentImage].FullName);
-//         currentImage = (currentImage >= images.Length) ? 0 : currentImage;
-//     }
-// }
-
-// SystemParametersInfo(SPI_SETDESKWALLPAPER, 0, (void*)s.c_str(),
-// SPIF_SENDCHANGE);
