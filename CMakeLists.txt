@@ -92,19 +92,17 @@ find_package(simdjson CONFIG REQUIRED)
 
 
 file(GLOB_RECURSE HEADERS "include/*.hpp" "include/*.h" "include/*.tpp")
-file(GLOB_RECURSE SOURCES "src/*.cpp" "src/*.c" "src/*.hpp" "src/*.h" "src/*.tpp")
-add_executable(${PROJECT_NAME} ${HEADERS} ${SOURCES})
-# add_executable(${PROJECT_NAME} WIN32 ${HEADERS} ${SOURCES})
+file(GLOB_RECURSE SOURCES "src/*.cpp" "src/*.c" "src/*.hpp" "src/*.h" "src/*.tpp" "resources/*.rc")
+# add_executable(${PROJECT_NAME} ${HEADERS} ${SOURCES})
+add_executable(${PROJECT_NAME} WIN32 ${HEADERS} ${SOURCES})
 target_include_directories(${PROJECT_NAME} PRIVATE include)
 target_include_directories(${PROJECT_NAME} PRIVATE src) # For based paths.
 target_link_libraries(${PROJECT_NAME} PRIVATE
 	fea_libs
 	WIL
-	simdjson::simdjson
-	# onetbb::onetbb
-	# httplib::httplib
-	# openssl::openssl
-	# tinyxml2::tinyxml2
+	# simdjson::simdjson
+	Cfgmgr32
+	OneCoreUAP
 )
 
 fea_set_compile_options(${PROJECT_NAME} PUBLIC)
