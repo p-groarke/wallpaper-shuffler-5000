@@ -62,7 +62,7 @@ using serialize_time_point = std::chrono::system_clock::time_point;
 using serialize_duration = std::chrono::system_clock::duration;
 
 inline const coinit _coinit;
-#if 1
+#if 0
 const serialize_duration shuffle_interval = std::chrono::days{ 1 };
 #else
 // const serialize_duration shuffle_interval = std::chrono::hours{ 1 };
@@ -76,11 +76,6 @@ const std::array<std::wstring, 4> img_extensions{
 };
 
 struct img {
-	bool shown = false;
-	serialize_time_point shown_timestamp{};
-	uint64_t file_size = 0;
-	std::wstring filename;
-
 	friend void serialize(const img& v, fea::serializer& ofs) {
 		using fea::serialize;
 		serialize(v.shown, ofs);
@@ -106,17 +101,46 @@ struct img {
 		return true;
 	}
 
-	// auto operator<=>(const img&) const noexcept = default;
+	bool shown = false;
+	serialize_time_point shown_timestamp{};
+	uint64_t file_size = 0;
+	std::wstring filename;
+};
+
+struct wallpaper {
+	friend void serialize(const wallpaper& v, fea::serializer& ofs) {
+		using fea::serialize;
+		serialize(v.display_id, ofs);
+		serialize(v.img_filename, ofs);
+	}
+
+	friend bool deserialize(fea::deserializer& ifs, wallpaper& v) {
+		using fea::deserialize;
+		if (!deserialize(ifs, v.display_id)) {
+			return false;
+		}
+		if (!deserialize(ifs, v.img_filename)) {
+			return false;
+		}
+		return true;
+	}
+
+	friend auto operator<=>(const wallpaper&, const wallpaper&) = default;
+
+	std::wstring display_id;
+	std::wstring img_filename;
+
+	// The path is not serialized, forcing runtime reconstruction thus allowing
+	// image folder to change.
+	std::wstring img_filepath;
 };
 
 struct save_data {
-	serialize_time_point last_shuffle_timestamp{};
-	std::vector<img> imgs;
-
 	friend void serialize(const save_data& v, fea::serializer& ofs) {
 		using fea::serialize;
 		serialize(v.last_shuffle_timestamp, ofs);
 		serialize(v.imgs, ofs);
+		serialize(v.wallpapers, ofs);
 	}
 
 	friend bool deserialize(fea::deserializer& ifs, save_data& v) {
@@ -127,8 +151,20 @@ struct save_data {
 		if (!deserialize(ifs, v.imgs)) {
 			return false;
 		}
+		if (!deserialize(ifs, v.wallpapers)) {
+			return false;
+		}
 		return true;
 	}
+
+	// Last timestamp we updated and shuffled the images.
+	serialize_time_point last_shuffle_timestamp{};
+
+	// Our image queue / playlist.
+	std::vector<img> imgs;
+
+	// The expected currently displayed images (to fix windows 11 bugs).
+	std::vector<wallpaper> wallpapers;
 };
 
 // Log status / info to output, ignored if not in verbose mode.
@@ -303,8 +339,8 @@ void randomizeit(RndIt first, RndIt last) {
 // Fills vector with monitor ids.
 // Returns true on success.
 [[nodiscard]]
-bool get_monitors(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
-		bool verbose, std::vector<std::wstring>* monitor_ids_ptr) {
+bool get_displays(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
+		bool verbose, std::vector<std::wstring>* display_ids_ptr) {
 	unsigned num_monitors = 0;
 	if (!SUCCEEDED(
 				desktop_wallpaper->GetMonitorDevicePathCount(&num_monitors))) {
@@ -314,14 +350,14 @@ bool get_monitors(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
 
 	if (num_monitors == 0) {
 		log_warning(L"Detected zero monitors, behaving as if there was one.\n");
-		monitor_ids_ptr->push_back(L""); // This does work.
+		display_ids_ptr->push_back(L""); // This does work.
 		return true;
 	}
 
 	log_status(verbose, L"Detected {} monitors :\n", num_monitors);
 
 	// Filter bad / virtual monitors.
-	monitor_ids_ptr->reserve(num_monitors);
+	display_ids_ptr->reserve(num_monitors);
 	for (size_t i = 0; i < num_monitors; ++i) {
 		wchar_t* str_ptr = nullptr;
 		if (!SUCCEEDED(desktop_wallpaper->GetMonitorDevicePathAt(
@@ -335,14 +371,42 @@ bool get_monitors(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
 			continue;
 		}
 
-		std::wstring id_str{ str_ptr };
-		if (id_str.empty()) {
-			log_status(verbose, L"\tEmpty monitor id string, skipping.\n");
-			continue;
+		log_status(verbose, L"\t{}\n", str_ptr);
+		display_ids_ptr->push_back(std::wstring{ str_ptr });
+	}
+
+	// We always want "" first, sort just to make everything predictable.
+	std::sort(display_ids_ptr->begin(), display_ids_ptr->end());
+	return true;
+}
+
+// Gets the currently displayed OS wallpapers.
+// Returns true on success.
+[[nodiscard]]
+bool get_wallpapers(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
+		bool verbose, std::vector<wallpaper>* wallpapers_ptr) {
+	std::vector<std::wstring> displays;
+	if (!get_displays(desktop_wallpaper, verbose, &displays)) {
+		return false;
+	}
+
+	std::vector<wallpaper>& wallpapers = *wallpapers_ptr;
+	for (size_t i = 0; i < displays.size(); ++i) {
+		const wchar_t* monitor_id_str = displays[i].c_str();
+		wchar_t* wallpaper_path = nullptr;
+		if (!SUCCEEDED(desktop_wallpaper->GetWallpaper(
+					monitor_id_str, &wallpaper_path))) {
+			log_error(L"Couldn't get current wallpaper for monitor '{}'.\n",
+					monitor_id_str);
+			return false;
 		}
 
-		log_status(verbose, L"\t{}\n", str_ptr);
-		monitor_ids_ptr->push_back(std::move(id_str));
+		std::filesystem::path wp{ wallpaper_path };
+		wallpapers.push_back(wallpaper{
+				.display_id = displays[i],
+				.img_filename = wp.filename().wstring(),
+				.img_filepath = wp.wstring(),
+		});
 	}
 
 	return true;
@@ -352,23 +416,23 @@ bool get_monitors(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
 // Returns true on success.
 [[nodiscard]]
 bool set_wallpapers(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
-		const std::vector<std::wstring>& monitor_ids,
-		const std::vector<std::filesystem::path>& wallpapers, bool verbose) {
-	if (monitor_ids.size() < 1) {
-		log_error(L"There should be at least 1 monitor id.");
+		const std::vector<wallpaper>& wallpapers, bool verbose) {
+	if (wallpapers.empty()) {
+		log_error(L"There should be at least 1 wallpaper to display.");
 		return false;
 	}
 
-	if (wallpapers.size() != monitor_ids.size()) {
-		log_error(L"Invalid amount of wallpapers : '{}' vs '{}'\n",
-				wallpapers.size(), monitor_ids.size());
-		return false;
+	if constexpr (fea::debug_build) {
+		// Either we don't contain the virtual "" display, or it is at the
+		// beginning.
+		[[maybe_unused]]
+		auto it = std::ranges::find(wallpapers, L"", &wallpaper::display_id);
+		assert(it == wallpapers.end() || it == wallpapers.begin());
 	}
 
 	// Sleep in between calls, give some time to windows its very slow.
 	const std::chrono::milliseconds sleep_time
-			= std::chrono::milliseconds{ 500 };
-	// const std::chrono::milliseconds long_sleep_time = sleep_time * 10;
+			= std::chrono::milliseconds{ 250 };
 
 	// Set the style to 'Fill'.
 	{
@@ -382,44 +446,23 @@ bool set_wallpapers(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
 		if (DESKTOP_WALLPAPER_POSITION wallpaper_pos = DWPOS_CENTER;
 				SUCCEEDED(desktop_wallpaper->GetPosition(&wallpaper_pos))
 				&& wallpaper_pos != DWPOS_FILL) {
-			log_error(L"Windows reset wallpaper fill.\n");
+			log_error(L"Wallpaper fill was reset.\n");
 			return false;
 		}
-	}
-
-	// Set the first image everywhere ("") once. This sticks after a monitor
-	// disconnect or sleep. If we don't do this, the wallpapers are completely
-	// reset to an unrelated image when monitors are disconnected.
-	{
-		const std::filesystem::path& path = wallpapers.front();
-		if (!SUCCEEDED(desktop_wallpaper->SetWallpaper(L"", path.c_str()))) {
-			log_error(L"Couldn't set wallpaper.\n");
-			return false;
-		}
-		std::this_thread::sleep_for(sleep_time);
-
-		if (wchar_t* wallpaper_path = nullptr;
-				SUCCEEDED(desktop_wallpaper->GetWallpaper(L"", &wallpaper_path))
-				&& std::filesystem::path{ wallpaper_path } != path) {
-			log_error(L"Windows reset wallpaper image.\n");
-			return false;
-		}
-	}
-
-	// If we only have 1 wallpaper, we can exit now.
-	if (monitor_ids.size() == 1) {
-		return true;
 	}
 
 	// Set the wallpapers for each monitor.
 	for (size_t i = 0; i < wallpapers.size(); ++i) {
-		const std::filesystem::path& path = wallpapers[i];
-		log_status(verbose, L"Setting wallpaper on monitor {} : '{}'\n", i,
-				path.wstring());
+		const wallpaper& w = wallpapers[i];
+		assert(w.img_filepath != L"");
 
-		const wchar_t* monitor_id_str = monitor_ids[i].c_str();
+		log_status(verbose, L"Setting wallpaper : '{}'\n\ton monitor : '{}'\n",
+				w.img_filepath, w.display_id);
+
+		const wchar_t* monitor_id_cstr = w.display_id.c_str();
+		const wchar_t* img_path_cstr = w.img_filepath.c_str();
 		if (!SUCCEEDED(desktop_wallpaper->SetWallpaper(
-					monitor_id_str, path.c_str()))) {
+					monitor_id_cstr, img_path_cstr))) {
 			log_error(L"Couldn't set wallpaper.\n");
 			return false;
 		}
@@ -427,9 +470,10 @@ bool set_wallpapers(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
 
 		if (wchar_t* wallpaper_path = nullptr;
 				SUCCEEDED(desktop_wallpaper->GetWallpaper(
-						monitor_id_str, &wallpaper_path))
-				&& std::filesystem::path{ wallpaper_path } != path) {
-			log_error(L"Windows reset wallpaper image.\n");
+						monitor_id_cstr, &wallpaper_path))
+				&& std::filesystem::path{ wallpaper_path }
+						   != std::filesystem::path{ w.img_filepath }) {
+			log_error(L"Wallpaper image was reset.\n");
 			return false;
 		}
 	}
@@ -441,65 +485,68 @@ bool set_wallpapers(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
 // Returns true on success.
 [[nodiscard]]
 bool fix_win11(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
-		const save_data& data, const std::filesystem::path& img_folder,
-		bool verbose) {
-	assert(!data.imgs.empty());
-	log_status(verbose, L"Checking if we need to fix Windows 11 bug.\n");
-
-	if (!data.imgs.back().shown) {
-		// Nothing was ever shown.
-		log_status(
-				verbose, L"No wallpaper were ever selected. Weird but OK.\n");
+		const std::filesystem::path& img_folder,
+		std::vector<wallpaper> expected_wallpapers, bool verbose) {
+	if (expected_wallpapers.empty()) {
+		// Nothing to do, not failure.
 		return true;
 	}
+	log_status(verbose,
+			L"Checking if we need to reset wallpapers (Windows 11 bug).\n");
 
-	std::vector<std::filesystem::path> expected_wallpapers;
-	serialize_time_point last_timestamp = data.imgs.back().shown_timestamp;
-	for (const img& image : data.imgs) {
-		if (image.shown && image.shown_timestamp == last_timestamp) {
-			expected_wallpapers.push_back(img_folder / image.filename);
+	// Cleanup saved wallpapers.
+	{
+		// Reconstruct path, we only serialize filename to allow changing
+		// folder.
+		for (wallpaper& w : expected_wallpapers) {
+			assert(w.img_filename != L"");
+			w.img_filepath = img_folder / w.img_filename;
+		}
+
+		// Remove deleted files.
+		auto new_end = std::remove_if(expected_wallpapers.begin(),
+				expected_wallpapers.end(), [](const wallpaper& ew) {
+					return !std::filesystem::exists(ew.img_filepath);
+				});
+		expected_wallpapers.erase(new_end, expected_wallpapers.end());
+		if (expected_wallpapers.empty()) {
+			return true;
 		}
 	}
 
-	std::vector<std::wstring> monitor_ids;
-	if (!get_monitors(desktop_wallpaper, verbose, &monitor_ids)) {
+	std::vector<wallpaper> current_wallpapers;
+	if (!get_wallpapers(desktop_wallpaper, verbose, &current_wallpapers)) {
 		return false;
 	}
 
-	for (size_t i = 0; i < monitor_ids.size(); ++i) {
-		if (i >= expected_wallpapers.size()) {
-			expected_wallpapers.push_back(expected_wallpapers.back());
+	// Remove currently shown wallpapers.
+	for (const wallpaper& cw : current_wallpapers) {
+		auto it = std::find(
+				expected_wallpapers.begin(), expected_wallpapers.end(), cw);
+		if (it != expected_wallpapers.end()) {
+			expected_wallpapers.erase(it);
 		}
 	}
-	assert(expected_wallpapers.size() == monitor_ids.size());
 
-	// Collect all current wallpapers.
-	std::vector<std::filesystem::path> current_wallpapers;
-	for (size_t i = 0; i < monitor_ids.size(); ++i) {
-		const wchar_t* monitor_id_str = monitor_ids[i].c_str();
-		wchar_t* wallpaper_path = nullptr;
-		if (!SUCCEEDED(desktop_wallpaper->GetWallpaper(
-					monitor_id_str, &wallpaper_path))) {
-			log_error(L"Couldn't get current wallpaper for monitor '{}'.\n",
-					monitor_id_str);
-			return false;
-		}
-		current_wallpapers.push_back(std::filesystem::path{ wallpaper_path });
-	}
-
+	// Remove wallpapers for displays that aren't connected anymore.
 	{
-		std::sort(current_wallpapers.begin(), current_wallpapers.end());
-		auto new_end = std::unique(
-				current_wallpapers.begin(), current_wallpapers.end());
-		current_wallpapers.erase(new_end, current_wallpapers.end());
+		auto new_end = std::remove_if(expected_wallpapers.begin(),
+				expected_wallpapers.end(), [&](const wallpaper& ew) {
+					auto it = std::find_if(current_wallpapers.begin(),
+							current_wallpapers.end(), [&](const wallpaper& cw) {
+								return cw.display_id == ew.display_id;
+							});
+					return it == current_wallpapers.end();
+				});
+		expected_wallpapers.erase(new_end, expected_wallpapers.end());
 	}
 
-	if (current_wallpapers.size() != expected_wallpapers.size()) {
-		log_status(verbose, L"Detected Windows 11 bug! Fixing.\n");
-		return set_wallpapers(
-				desktop_wallpaper, monitor_ids, expected_wallpapers, verbose);
+	if (expected_wallpapers.empty()) {
+		return true;
 	}
-	return true;
+
+	log_status(verbose, L"Detected incorrect wallpapers, fixing.\n");
+	return set_wallpapers(desktop_wallpaper, expected_wallpapers, verbose);
 }
 
 // Checks our data, builds a playlist of wallpapers, displays them if time is
@@ -531,10 +578,9 @@ bool update(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
 		// We may have been woken up by displays connecting.
 		// If so, double check we are still displaying the right wallpapers
 		// (fix win 11 being dumb).
-		if (!data.imgs.empty()) {
-			if (!fix_win11(desktop_wallpaper, data, img_folder, verbose)) {
-				return false;
-			}
+		if (!fix_win11(
+					desktop_wallpaper, img_folder, data.wallpapers, verbose)) {
+			return false;
 		}
 
 		log_status(verbose, L"Shuffle not required, going back to sleep.\n");
@@ -542,8 +588,8 @@ bool update(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
 		return true;
 	}
 
-	(*out_next_update) = now + shuffle_interval;
 	log_status(verbose, L"Time interval reached, changing wallpaper.\n");
+	(*out_next_update) = now + shuffle_interval;
 
 	// Remove obsolete or changed images from our saved data.
 	{
@@ -663,31 +709,60 @@ bool update(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
 		return false;
 	}
 
-	// Change the wallpaper.
+	// Change the wallpapers.
 	{
-		std::vector<std::wstring> monitor_ids;
-		if (!get_monitors(desktop_wallpaper, verbose, &monitor_ids)) {
+		std::vector<std::wstring> displays;
+		if (!get_displays(desktop_wallpaper, verbose, &displays)) {
 			return false;
 		}
-		assert(monitor_ids.size() >= 1);
+		assert(displays.size() >= 1);
 
-		std::vector<std::filesystem::path> selected_imgs;
-		for (size_t i = 0; i < monitor_ids.size(); ++i) {
-			if (i >= data.imgs.size()) {
-				assert(i > 0); // Should at least have 1 wallpaper.
-				selected_imgs.push_back(selected_imgs.back());
-				continue;
-			}
-			selected_imgs.push_back(img_folder / data.imgs[i].filename);
+		std::vector<wallpaper>& wallpapers = data.wallpapers;
+		wallpapers.clear();
+
+		// We always want to have the virtual display "" at the beginning,
+		// with the same image as the first.
+		// This sets the image on all displays as a backup which will be shown
+		// if you disconnect and reconnect your displays in Windows 11.
+		{
+			// Remove the virtual display from the list if it is there.
+			auto new_end = std::remove(
+					displays.begin(), displays.end(), std::wstring{ L"" });
+			displays.erase(new_end, displays.end());
+
+			// Guarantee the first wallpaper is the virtual one.
+			wallpapers.push_back(wallpaper{
+					.display_id = L"",
+					.img_filename = data.imgs.front().filename,
+					.img_filepath = img_folder / data.imgs.front().filename,
+			});
 		}
 
-		if (!set_wallpapers(
-					desktop_wallpaper, monitor_ids, selected_imgs, verbose)) {
+		for (size_t i = 0; i < displays.size(); ++i) {
+			if (i >= data.imgs.size()) {
+				assert(i > 0); // Should at least have 1 wallpaper.
+				wallpapers.push_back(wallpaper{
+						.display_id = displays[i],
+						.img_filename = wallpapers.back().img_filename,
+						.img_filepath = wallpapers.back().img_filepath,
+				});
+				continue;
+			}
+
+			wallpapers.push_back(wallpaper{
+					.display_id = displays[i],
+					.img_filename = data.imgs[i].filename,
+					.img_filepath = img_folder / data.imgs[i].filename,
+			});
+		}
+
+		assert(wallpapers.front().display_id == L"");
+		if (!set_wallpapers(desktop_wallpaper, wallpapers, verbose)) {
 			return false;
 		}
 
 		// Update shown value and move the images to the end of playlist.
-		for (size_t i = 0; i < monitor_ids.size(); ++i) {
+		for (size_t i = 0; i < displays.size(); ++i) {
 			if (i >= data.imgs.size()) {
 				break;
 			}
@@ -697,7 +772,7 @@ bool update(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
 			image.shown_timestamp = now;
 		}
 
-		size_t num = (std::min)(monitor_ids.size(), data.imgs.size());
+		size_t num = (std::min)(displays.size(), data.imgs.size());
 		std::rotate(
 				data.imgs.begin(), data.imgs.begin() + num, data.imgs.end());
 
@@ -875,82 +950,3 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR /*lpCmdLine*/, int) {
 
 	return EXIT_SUCCESS;
 }
-
-// TODO :
-
-/*
- TEST1
-
- If any of the other solutions worked, try this:
-	Make sure you save the theme with the two different images.
-	Go to your themes folder (usually
-	C:\Users\%USERNAME%\AppData\Local\Microsoft\Windows\Themes Choose the file
-	with the name of your theme with the .theme extension. Right click, open
-	with NotePad. Under [Control Panel\Desktop] make sure that these two
-	options are present:
- MultimonBackgrounds=1
- PicturePosition=2
-	Save changes.
-	After you restart, your monitor wallpapers should stay the same.
-*/
-
-/*
-(Windows 11)
-
-I just fixed this on mine
-
-	Navigate to C:\Users\"Username"\AppData\Roaming\Microsoft\Windows\Themes
-	Delete the files int hat folder (Usually named transcoded)
-	set individual backgrounds again
-	Check folder there should now be 1 new file for each abckground
-
-This happens because windows transcodes the image you use typically compressing
-it to 85% you can get around this permanently by doing this:
-
-	Use the Windows key + R keyboard shortcut to open the Run command.
-	Type regedit, and click OK to open the registry.
-	Navigate to HKEY_CURRENT_USER\Control Panel\Desktop
-	On the right side, right-click, select New, and click on DWORD (32-bit)
-Value. Name the DWORD JPEGImportQuality and press Enter. Double-click the newly
-created DWORD, and user Base, select the Decimal option. Change the DWORD value
-from 0 to 100. Default compression Windows is 85 percent usually, and if you set
-the DWORD to 100 will completely disable automatic JPEG image file compression.
-	Click OK.
-	Close the Registry.
-	Restart your computer to complete the task.
-*/
-
-
-/*
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <iostream>
-
-std::mutex mtx;
-std::condition_variable cv;
-bool stop_flag = false;
-
-void worker() {
-	std::unique_lock<std::mutex> lock(mtx);
-	// Wait until stop_flag is true OR notified by another thread
-	cv.wait(lock, [] { return stop_flag; });
-	std::cout << "Thread woke up and exiting.\n";
-}
-
-int main() {
-	std::thread t(worker);
-
-	// Simulate work or delay
-	std::this_thread::sleep_for(std::chrono::seconds(2));
-
-	{
-		std::lock_guard<std::mutex> lock(mtx);
-		stop_flag = true;
-	}
-	cv.notify_one(); // Wake the worker thread
-
-	t.join();
-	return 0;
-}
-*/
