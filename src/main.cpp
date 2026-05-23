@@ -62,7 +62,7 @@ using serialize_time_point = std::chrono::system_clock::time_point;
 using serialize_duration = std::chrono::system_clock::duration;
 
 inline const coinit _coinit;
-#if 0
+#if 1
 const serialize_duration shuffle_interval = std::chrono::days{ 1 };
 #else
 // const serialize_duration shuffle_interval = std::chrono::hours{ 1 };
@@ -78,20 +78,12 @@ const std::array<std::wstring, 4> img_extensions{
 struct img {
 	friend void serialize(const img& v, fea::serializer& ofs) {
 		using fea::serialize;
-		serialize(v.shown, ofs);
-		serialize(v.shown_timestamp, ofs);
 		serialize(v.file_size, ofs);
 		serialize(v.filename, ofs);
 	}
 
 	friend bool deserialize(fea::deserializer& ifs, img& v) {
 		using fea::deserialize;
-		if (!deserialize(ifs, v.shown)) {
-			return false;
-		}
-		if (!deserialize(ifs, v.shown_timestamp)) {
-			return false;
-		}
 		if (!deserialize(ifs, v.file_size)) {
 			return false;
 		}
@@ -101,8 +93,6 @@ struct img {
 		return true;
 	}
 
-	bool shown = false;
-	serialize_time_point shown_timestamp{};
 	uint64_t file_size = 0;
 	std::wstring filename;
 };
@@ -139,7 +129,8 @@ struct save_data {
 	friend void serialize(const save_data& v, fea::serializer& ofs) {
 		using fea::serialize;
 		serialize(v.last_shuffle_timestamp, ofs);
-		serialize(v.imgs, ofs);
+		serialize(v.playlist, ofs);
+		serialize(v.recycle_bin, ofs);
 		serialize(v.wallpapers, ofs);
 	}
 
@@ -148,7 +139,10 @@ struct save_data {
 		if (!deserialize(ifs, v.last_shuffle_timestamp)) {
 			return false;
 		}
-		if (!deserialize(ifs, v.imgs)) {
+		if (!deserialize(ifs, v.playlist)) {
+			return false;
+		}
+		if (!deserialize(ifs, v.recycle_bin)) {
 			return false;
 		}
 		if (!deserialize(ifs, v.wallpapers)) {
@@ -161,7 +155,10 @@ struct save_data {
 	serialize_time_point last_shuffle_timestamp{};
 
 	// Our image queue / playlist.
-	std::vector<img> imgs;
+	std::vector<img> playlist;
+
+	// TODO : Used / shown images of current playlist.
+	std::vector<img> recycle_bin;
 
 	// The expected currently displayed images (to fix windows 11 bugs).
 	std::vector<wallpaper> wallpapers;
@@ -291,13 +288,23 @@ bool set_registry_value(HKEY hkey, const std::wstring& path,
 
 template <class RndIt>
 void randomizeit(RndIt first, RndIt last) {
-	// auto printit = [&]() {
-	//	for (auto it = first; it != last; ++it) {
-	//		std::wcout << std::format(L"{}, ", it->filename);
-	//	}
-	//	std::wcout << "\n";
-	// };
+	[[maybe_unused]]
+	auto printit
+			= [&]() {
+				  for (auto it = first; it != last; ++it) {
+					  std::wcout << std::format(L"{}, ", it->filename);
+				  }
+				  std::wcout << "\n";
+			  };
 
+#if 0
+	auto now = std::chrono::steady_clock::now().time_since_epoch();
+	unsigned t1 = unsigned(now.count());
+	unsigned t2 = unsigned((++now).count());
+	unsigned t3 = unsigned((++now).count());
+	unsigned t4 = unsigned((++now).count());
+	assert(t1 != t2 && t2 != t3 && t3 != t4);
+#else
 	unsigned t1 = unsigned(
 			std::chrono::steady_clock::now().time_since_epoch().count());
 	unsigned t2 = 0;
@@ -315,8 +322,7 @@ void randomizeit(RndIt first, RndIt last) {
 		t4 = unsigned(
 				std::chrono::steady_clock::now().time_since_epoch().count());
 	} while (t4 == t3);
-
-	assert(t1 != t2 && t2 != t3 && t3 != t4);
+#endif
 
 	std::random_device rd;
 	std::seed_seq seed{
@@ -334,6 +340,101 @@ void randomizeit(RndIt first, RndIt last) {
 	std::reverse(first, last);
 	std::shuffle(first, last, gen);
 	// printit();
+}
+
+// Clean image playlist (remove deleted files, add new files, etc).
+// Returns true on success.
+bool refresh_data(const std::filesystem::path& img_folder, bool verbose,
+		save_data* data_ptr) {
+	save_data& data = *data_ptr;
+
+	// We've reached the end of our playlist, reset it.
+	if (data.playlist.empty()) {
+		data.playlist = std::move(data.recycle_bin);
+		data.recycle_bin = {};
+		randomizeit(data.playlist.begin(), data.playlist.end());
+	}
+
+	// Remove obsolete or changed images from our playlist.
+	{
+		auto ret = std::ranges::remove_if(data.playlist, [&](const img& v) {
+			std::filesystem::path img_path = img_folder / v.filename;
+			if (!std::filesystem::exists(img_path)) {
+				return true;
+			}
+			if (uint64_t(std::filesystem::file_size(img_path)) != v.file_size) {
+				return true;
+			}
+			return false;
+		});
+		data.playlist.erase(ret.begin(), ret.end());
+	}
+
+	// Go through the folder and gather new images.
+	std::vector<std::filesystem::path> new_images;
+	{
+		log_status(verbose, L"Scanning folder.\n");
+
+		for (const std::filesystem::path& p :
+				std::filesystem::directory_iterator(img_folder)) {
+			if (std::filesystem::is_directory(p)) {
+				log_status(verbose, L"Skipping sub-folder '{}/'\n",
+						p.filename().wstring());
+				continue;
+			}
+
+			std::wstring ext = p.extension();
+			if (!std::ranges::contains(img_extensions, ext)) {
+				log_status(verbose, L"Skipping non-image '{}'\n",
+						p.filename().wstring());
+				continue;
+			}
+
+			new_images.push_back(p);
+		}
+
+		if (new_images.empty()) {
+			log_error(L"No images found in folder.\n");
+			return false;
+		}
+
+		// Remove recycled images from the new images.
+		std::unordered_set<std::filesystem::path> recycle_set;
+		for (const img& v : data.recycle_bin) {
+			recycle_set.insert(v.filename);
+		}
+
+		// Remove old images from the new images in the folder.
+		std::unordered_set<std::filesystem::path> playlist_set;
+		for (const img& v : data.playlist) {
+			playlist_set.insert(v.filename);
+		}
+
+		auto ret = std::ranges::remove_if(
+				new_images, [&](const std::filesystem::path& p) {
+					return playlist_set.contains(p.filename())
+						|| recycle_set.contains(p.filename());
+				});
+		new_images.erase(ret.begin(), ret.end());
+	}
+
+	// Shuffle in the new images into the pre-existing images.
+	if (!new_images.empty()) {
+		log_status(verbose, L"Adding {} new images to the playlist.\n",
+				new_images.size());
+
+		data.playlist.reserve(data.playlist.size() + new_images.size());
+		for (const std::filesystem::path& p : new_images) {
+			data.playlist.push_back(img{
+					.file_size = std::filesystem::file_size(p),
+					.filename = p.filename(),
+			});
+		}
+
+		randomizeit(data.playlist.begin(), data.playlist.end());
+	}
+
+	return true;
 }
 
 // Fills vector with monitor ids.
@@ -371,7 +472,7 @@ bool get_displays(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
 			continue;
 		}
 
-		log_status(verbose, L"\t{}\n", str_ptr);
+		log_status(verbose, L"\t'{}'\n", str_ptr);
 		display_ids_ptr->push_back(std::wstring{ str_ptr });
 	}
 
@@ -452,12 +553,13 @@ bool set_wallpapers(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
 	}
 
 	// Set the wallpapers for each monitor.
+	log_status(verbose, L"Setting {} wallpapers :\n", wallpapers.size());
 	for (size_t i = 0; i < wallpapers.size(); ++i) {
 		const wallpaper& w = wallpapers[i];
 		assert(w.img_filepath != L"");
 
-		log_status(verbose, L"Setting wallpaper : '{}'\n\ton monitor : '{}'\n",
-				w.img_filepath, w.display_id);
+		log_status(verbose, L"\t'{}' (monitor : '{}')\n", w.img_filename,
+				w.display_id);
 
 		const wchar_t* monitor_id_cstr = w.display_id.c_str();
 		const wchar_t* img_path_cstr = w.img_filepath.c_str();
@@ -573,8 +675,11 @@ bool update(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
 	serialize_time_point next_update
 			= data.last_shuffle_timestamp + shuffle_interval;
 
+	bool needs_update = now >= next_update;
+	// TODO : Handle new display connected.
+
 	// If we have nothing to do, exit cleanly now.
-	if (now < next_update) {
+	if (!needs_update) {
 		// We may have been woken up by displays connecting.
 		// If so, double check we are still displaying the right wallpapers
 		// (fix win 11 being dumb).
@@ -591,120 +696,11 @@ bool update(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
 	log_status(verbose, L"Time interval reached, changing wallpaper.\n");
 	(*out_next_update) = now + shuffle_interval;
 
-	// Remove obsolete or changed images from our saved data.
-	{
-		auto new_end = std::remove_if(
-				data.imgs.begin(), data.imgs.end(), [&](const img& v) {
-					std::filesystem::path img_path = img_folder / v.filename;
-					if (!std::filesystem::exists(img_path)) {
-						return true;
-					}
-					if (uint64_t(std::filesystem::file_size(img_path))
-							!= v.file_size) {
-						return true;
-					}
-					return false;
-				});
-		data.imgs.erase(new_end, data.imgs.end());
-
-		assert(std::is_partitioned(data.imgs.begin(), data.imgs.end(),
-				[](const img& v) { return !v.shown; }));
+	if (!refresh_data(img_folder, verbose, &data)) {
+		return false;
 	}
 
-#if 0
-	// TEMP TESTING
-	{
-		auto notshown_end = std::find_if(data.imgs.begin(), data.imgs.end(),
-				[](const img& v) { return v.shown; });
-		size_t s = size_t(std::distance(data.imgs.begin(), notshown_end));
-
-		// Erase half unshown for testing purposes.
-		data.imgs.erase(data.imgs.begin(), data.imgs.begin() + (s / 2));
-	}
-#endif
-
-	// Go through the folder and gather new images.
-	std::vector<std::filesystem::path> new_images;
-	{
-		log_status(verbose, L"Scanning folder.\n");
-
-		for (const std::filesystem::path& p :
-				std::filesystem::directory_iterator(img_folder)) {
-			if (std::filesystem::is_directory(p)) {
-				log_status(verbose, L"Skipping sub-folder '{}/'\n",
-						p.filename().wstring());
-				continue;
-			}
-
-			std::wstring ext = p.extension();
-			if (!std::ranges::contains(img_extensions, ext)) {
-				log_status(verbose, L"Skipping non-image '{}'\n",
-						p.filename().wstring());
-				continue;
-			}
-
-			new_images.push_back(p);
-		}
-
-		if (new_images.empty()) {
-			log_error(L"No images found in folder.\n");
-			return false;
-		}
-
-		// Remove old images from the new images in the folder.
-		std::unordered_set<std::filesystem::path> old_images_set;
-		for (const img& v : data.imgs) {
-			old_images_set.insert(v.filename);
-		}
-
-		auto new_end = std::remove_if(new_images.begin(), new_images.end(),
-				[&](const std::filesystem::path& p) {
-					return old_images_set.contains(p.filename());
-				});
-		new_images.erase(new_end, new_images.end());
-	}
-
-	// Shuffle in the new images into the pre-existing images.
-	if (!new_images.empty()) {
-		log_status(verbose, L"Adding {} new images to the playlist.\n",
-				new_images.size());
-
-		std::vector<img> temp;
-		temp.reserve(new_images.size());
-		for (const std::filesystem::path& p : new_images) {
-			assert(std::filesystem::exists(p)
-					&& !std::filesystem::is_directory(p));
-
-			temp.push_back(img{
-					.shown = false,
-					.file_size = std::filesystem::file_size(p),
-					.filename = p.filename(),
-			});
-		}
-		data.imgs.insert(data.imgs.begin(), temp.begin(), temp.end());
-
-		log_status(verbose, L"Randomizing.\n");
-		auto unshown_end = std::find_if(data.imgs.begin(), data.imgs.end(),
-				[](const img& v) { return v.shown; });
-		randomizeit(data.imgs.begin(), unshown_end);
-	}
-	assert(std::is_partitioned(data.imgs.begin(), data.imgs.end(),
-			[](const img& v) { return !v.shown; }));
-
-	// Check if we've reached the end and need to re-randomize.
-	if (std::all_of(data.imgs.begin(), data.imgs.end(),
-				[](const img& v) { return v.shown; })) {
-		log_status(verbose,
-				L"Reached end of playlist, reshuffling and restarting.\n");
-
-		randomizeit(data.imgs.begin(), data.imgs.end());
-
-		for (img& v : data.imgs) {
-			v.shown = false;
-		}
-	}
-
-	if (data.imgs.empty()) {
+	if (data.playlist.empty()) {
 		log_error(L"No images in playlist, exiting.\n");
 		return false;
 	}
@@ -717,6 +713,22 @@ bool update(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
 		}
 		assert(displays.size() >= 1);
 
+		if (displays.size() > data.playlist.size()) {
+			// We have more displays than images left in playlist.
+			// The playlist will get recomputed next update, so just grab
+			// a few images to fix.
+			for (size_t i = data.playlist.size(); i < displays.size(); ++i) {
+				if (data.recycle_bin.empty()) {
+					log_error(L"More displays than images, "
+							  L"please add more images.\n");
+					return false;
+				}
+				data.playlist.push_back(data.recycle_bin.front());
+				data.recycle_bin.erase(data.recycle_bin.begin());
+			}
+		}
+		assert(data.playlist.size() >= displays.size());
+
 		std::vector<wallpaper>& wallpapers = data.wallpapers;
 		wallpapers.clear();
 
@@ -726,33 +738,26 @@ bool update(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
 		// if you disconnect and reconnect your displays in Windows 11.
 		{
 			// Remove the virtual display from the list if it is there.
-			auto new_end = std::remove(
-					displays.begin(), displays.end(), std::wstring{ L"" });
-			displays.erase(new_end, displays.end());
+			auto ret = std::ranges::remove(displays, std::wstring{ L"" });
+			displays.erase(ret.begin(), ret.end());
 
 			// Guarantee the first wallpaper is the virtual one.
 			wallpapers.push_back(wallpaper{
 					.display_id = L"",
-					.img_filename = data.imgs.front().filename,
-					.img_filepath = img_folder / data.imgs.front().filename,
+					.img_filename = data.playlist.back().filename,
+					.img_filepath = img_folder / data.playlist.back().filename,
 			});
 		}
 
 		for (size_t i = 0; i < displays.size(); ++i) {
-			if (i >= data.imgs.size()) {
-				assert(i > 0); // Should at least have 1 wallpaper.
-				wallpapers.push_back(wallpaper{
-						.display_id = displays[i],
-						.img_filename = wallpapers.back().img_filename,
-						.img_filepath = wallpapers.back().img_filepath,
-				});
-				continue;
-			}
+			data.recycle_bin.push_back(std::move(data.playlist.back()));
+			data.playlist.pop_back();
 
 			wallpapers.push_back(wallpaper{
 					.display_id = displays[i],
-					.img_filename = data.imgs[i].filename,
-					.img_filepath = img_folder / data.imgs[i].filename,
+					.img_filename = data.recycle_bin.back().filename,
+					.img_filepath
+					= img_folder / data.recycle_bin.back().filename,
 			});
 		}
 
@@ -760,21 +765,6 @@ bool update(const CComPtr<IDesktopWallpaper>& desktop_wallpaper,
 		if (!set_wallpapers(desktop_wallpaper, wallpapers, verbose)) {
 			return false;
 		}
-
-		// Update shown value and move the images to the end of playlist.
-		for (size_t i = 0; i < displays.size(); ++i) {
-			if (i >= data.imgs.size()) {
-				break;
-			}
-
-			img& image = data.imgs[i];
-			image.shown = true;
-			image.shown_timestamp = now;
-		}
-
-		size_t num = (std::min)(displays.size(), data.imgs.size());
-		std::rotate(
-				data.imgs.begin(), data.imgs.begin() + num, data.imgs.end());
 
 		data.last_shuffle_timestamp = now;
 	}
